@@ -1,8 +1,8 @@
 {
   "name": "mubu-obsidian-sync",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "One-way sync from Mubu to Obsidian",
-  "author": "Pebble",
+  "author": "Bo Pan",
   "main": "main.js",
   "scripts": {
     "build": "node esbuild.config.mjs production",

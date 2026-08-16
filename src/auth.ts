@@ -1,7 +1,14 @@
 import { Platform } from "obsidian";
+import {
+  isAllowedLoginPopupUrl,
+  makeBrowserCompatibleUserAgent,
+  safeUrlForLog
+} from "./auth-policy";
 
-const LOGIN_URL = "https://mubu.com";
+const LOGIN_URL = "https://mubu.com/login";
 const SESSION_PARTITION = "persist:mubu-sync";
+const LOGIN_POLL_INTERVAL_MS = 1_000;
+const LOGIN_TIMEOUT_MS = 5 * 60 * 1_000;
 
 interface ElectronCookie {
   name: string;
@@ -18,6 +25,18 @@ interface ElectronSession {
 
 interface ElectronWebContents {
   session: ElectronSession;
+  getUserAgent(): string;
+  setUserAgent(userAgent: string): void;
+  setWindowOpenHandler(
+    handler: (details: { url: string }) => ElectronWindowOpenResponse
+  ): void;
+  on(event: "will-navigate" | "will-redirect", listener: (_event: unknown, url: string) => void): void;
+  on(event: "did-create-window", listener: (window: ElectronBrowserWindow) => void): void;
+}
+
+interface ElectronWindowOpenResponse {
+  action: "allow" | "deny";
+  overrideBrowserWindowOptions?: Record<string, unknown>;
 }
 
 interface ElectronBrowserWindow {
@@ -55,32 +74,48 @@ export async function loginToMubu(verifyToken: VerifyToken): Promise<string | nu
       height: 720,
       title: "登录幕布",
       show: true,
-      webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true,
-        partition: SESSION_PARTITION
-      }
+      webPreferences: secureWebPreferences()
     });
 
     let settled = false;
     let checking = false;
+    let pollTimer: number | null = null;
+    let timeoutTimer: number | null = null;
+
+    const clearTimers = (): void => {
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      if (timeoutTimer !== null) {
+        window.clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+    };
 
     const finish = (token: string | null): void => {
       if (settled) return;
       settled = true;
-      window.clearInterval(timer);
+      clearTimers();
       resolve(token);
     };
 
     const fail = (error: unknown): void => {
       if (settled) return;
       settled = true;
-      window.clearInterval(timer);
+      clearTimers();
       reject(error);
     };
 
-    const timer = window.setInterval(() => {
+    try {
+      configureLoginWindow(win);
+    } catch (error) {
+      fail(error);
+      if (!win.isDestroyed()) win.close();
+      return;
+    }
+
+    pollTimer = window.setInterval(() => {
       if (checking || settled || win.isDestroyed()) return;
       checking = true;
 
@@ -101,16 +136,69 @@ export async function loginToMubu(verifyToken: VerifyToken): Promise<string | nu
         .finally(() => {
           checking = false;
         });
-    }, 1_000);
+    }, LOGIN_POLL_INTERVAL_MS);
+
+    timeoutTimer = window.setTimeout(() => {
+      fail(new Error("幕布登录等待超时，请重试或使用手动 Token 模式"));
+      if (!win.isDestroyed()) win.close();
+    }, LOGIN_TIMEOUT_MS);
 
     win.on("closed", () => finish(null));
 
+    let loading: Promise<void> | void;
     try {
-      void win.loadURL(LOGIN_URL);
+      loading = win.loadURL(LOGIN_URL);
     } catch (error) {
       fail(error);
+      if (!win.isDestroyed()) win.close();
+      return;
     }
+
+    void Promise.resolve(loading).catch(error => {
+      fail(error);
+      if (!win.isDestroyed()) win.close();
+    });
   });
+}
+
+function configureLoginWindow(win: ElectronBrowserWindow): void {
+  const { webContents } = win;
+  const compatibleUserAgent = makeBrowserCompatibleUserAgent(webContents.getUserAgent());
+  if (compatibleUserAgent) webContents.setUserAgent(compatibleUserAgent);
+
+  webContents.setWindowOpenHandler(({ url }) => {
+    const safeUrl = safeUrlForLog(url);
+    if (!isAllowedLoginPopupUrl(url)) {
+      console.warn(`[Mubu Sync] Blocked login popup: ${safeUrl}`);
+      return { action: "deny" };
+    }
+
+    console.debug(`[Mubu Sync] Opening login popup in the Mubu session: ${safeUrl}`);
+    return {
+      action: "allow",
+      overrideBrowserWindowOptions: {
+        parent: win,
+        show: true,
+        webPreferences: secureWebPreferences()
+      }
+    };
+  });
+
+  const logNavigation = (_event: unknown, url: string): void => {
+    console.debug(`[Mubu Sync] Login navigation: ${safeUrlForLog(url)}`);
+  };
+  webContents.on("will-navigate", logNavigation);
+  webContents.on("will-redirect", logNavigation);
+  webContents.on("did-create-window", childWindow => configureLoginWindow(childWindow));
+}
+
+function secureWebPreferences(): Record<string, unknown> {
+  return {
+    nodeIntegration: false,
+    contextIsolation: true,
+    sandbox: true,
+    partition: SESSION_PARTITION
+  };
 }
 
 async function readJwtToken(session: ElectronSession): Promise<string | null> {

@@ -26,8 +26,42 @@ var import_obsidian4 = require("obsidian");
 
 // src/auth.ts
 var import_obsidian = require("obsidian");
-var LOGIN_URL = "https://mubu.com";
+
+// src/auth-policy.ts
+var ALLOWED_AUTH_HOSTS = /* @__PURE__ */ new Set([
+  "open.weixin.qq.com",
+  "open.work.weixin.qq.com",
+  "graph.qq.com"
+]);
+function isAllowedLoginPopupUrl(rawUrl) {
+  if (rawUrl === "about:blank") return true;
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "https:") return false;
+    const hostname = url.hostname.toLowerCase();
+    return hostname === "mubu.com" || hostname.endsWith(".mubu.com") || ALLOWED_AUTH_HOSTS.has(hostname);
+  } catch {
+    return false;
+  }
+}
+function makeBrowserCompatibleUserAgent(userAgent) {
+  return userAgent.replace(/\s+(?:electron|obsidian)\/[\w.-]+/gi, "").replace(/\s{2,}/g, " ").trim();
+}
+function safeUrlForLog(rawUrl) {
+  if (rawUrl === "about:blank") return rawUrl;
+  try {
+    const url = new URL(rawUrl);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return "[invalid URL]";
+  }
+}
+
+// src/auth.ts
+var LOGIN_URL = "https://mubu.com/login";
 var SESSION_PARTITION = "persist:mubu-sync";
+var LOGIN_POLL_INTERVAL_MS = 1e3;
+var LOGIN_TIMEOUT_MS = 5 * 60 * 1e3;
 async function loginToMubu(verifyToken) {
   if (!import_obsidian.Platform.isDesktop) {
     throw new Error("\u5E55\u5E03\u81EA\u52A8\u767B\u5F55\u76EE\u524D\u4EC5\u652F\u6301 Obsidian \u684C\u9762\u7248");
@@ -42,28 +76,42 @@ async function loginToMubu(verifyToken) {
       height: 720,
       title: "\u767B\u5F55\u5E55\u5E03",
       show: true,
-      webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true,
-        sandbox: true,
-        partition: SESSION_PARTITION
-      }
+      webPreferences: secureWebPreferences()
     });
     let settled = false;
     let checking = false;
+    let pollTimer = null;
+    let timeoutTimer = null;
+    const clearTimers = () => {
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+      if (timeoutTimer !== null) {
+        window.clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+    };
     const finish = (token) => {
       if (settled) return;
       settled = true;
-      window.clearInterval(timer);
+      clearTimers();
       resolve(token);
     };
     const fail = (error) => {
       if (settled) return;
       settled = true;
-      window.clearInterval(timer);
+      clearTimers();
       reject(error);
     };
-    const timer = window.setInterval(() => {
+    try {
+      configureLoginWindow(win);
+    } catch (error) {
+      fail(error);
+      if (!win.isDestroyed()) win.close();
+      return;
+    }
+    pollTimer = window.setInterval(() => {
       if (checking || settled || win.isDestroyed()) return;
       checking = true;
       void readJwtToken(win.webContents.session).then(async (token) => {
@@ -80,14 +128,60 @@ async function loginToMubu(verifyToken) {
       }).finally(() => {
         checking = false;
       });
-    }, 1e3);
+    }, LOGIN_POLL_INTERVAL_MS);
+    timeoutTimer = window.setTimeout(() => {
+      fail(new Error("\u5E55\u5E03\u767B\u5F55\u7B49\u5F85\u8D85\u65F6\uFF0C\u8BF7\u91CD\u8BD5\u6216\u4F7F\u7528\u624B\u52A8 Token \u6A21\u5F0F"));
+      if (!win.isDestroyed()) win.close();
+    }, LOGIN_TIMEOUT_MS);
     win.on("closed", () => finish(null));
+    let loading;
     try {
-      void win.loadURL(LOGIN_URL);
+      loading = win.loadURL(LOGIN_URL);
     } catch (error) {
       fail(error);
+      if (!win.isDestroyed()) win.close();
+      return;
     }
+    void Promise.resolve(loading).catch((error) => {
+      fail(error);
+      if (!win.isDestroyed()) win.close();
+    });
   });
+}
+function configureLoginWindow(win) {
+  const { webContents } = win;
+  const compatibleUserAgent = makeBrowserCompatibleUserAgent(webContents.getUserAgent());
+  if (compatibleUserAgent) webContents.setUserAgent(compatibleUserAgent);
+  webContents.setWindowOpenHandler(({ url }) => {
+    const safeUrl = safeUrlForLog(url);
+    if (!isAllowedLoginPopupUrl(url)) {
+      console.warn(`[Mubu Sync] Blocked login popup: ${safeUrl}`);
+      return { action: "deny" };
+    }
+    console.debug(`[Mubu Sync] Opening login popup in the Mubu session: ${safeUrl}`);
+    return {
+      action: "allow",
+      overrideBrowserWindowOptions: {
+        parent: win,
+        show: true,
+        webPreferences: secureWebPreferences()
+      }
+    };
+  });
+  const logNavigation = (_event, url) => {
+    console.debug(`[Mubu Sync] Login navigation: ${safeUrlForLog(url)}`);
+  };
+  webContents.on("will-navigate", logNavigation);
+  webContents.on("will-redirect", logNavigation);
+  webContents.on("did-create-window", (childWindow) => configureLoginWindow(childWindow));
+}
+function secureWebPreferences() {
+  return {
+    nodeIntegration: false,
+    contextIsolation: true,
+    sandbox: true,
+    partition: SESSION_PARTITION
+  };
 }
 async function readJwtToken(session) {
   const cookies = await session.cookies.get({ url: LOGIN_URL, name: "Jwt-Token" });

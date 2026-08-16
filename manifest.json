@@ -1,9 +1,9 @@
 {
   "id": "mubu-sync",
   "name": "Mubu Sync",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "minAppVersion": "1.11.4",
   "description": "One-way sync Mubu documents into your vault.",
-  "author": "Pebble",
+  "author": "Bo Pan",
   "isDesktopOnly": true
 }
